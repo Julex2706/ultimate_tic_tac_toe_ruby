@@ -1,8 +1,6 @@
 require 'digest'
-require 'yaml'
+require 'json'
 require 'colorize'
-
-CACHE_FILE = "utt_cache_digest.yml"
 
 $dev = nil
 loop do
@@ -37,6 +35,110 @@ if $dev
 end
 
 # -------------------
+# Cache helpers (JSON/chunked only)
+# -------------------
+
+CACHE_FILE = "utt_cache_digest.json"
+CHUNK_DEFAULT_ENTRIES = 2000
+
+def save_seen_json(filename, seen_hash, entries_per_chunk: CHUNK_DEFAULT_ENTRIES)
+  total_entries = seen_hash.size
+  File.open(filename, "w", encoding: "utf-8") do |f|
+    written_entries = 0
+    enumerator = seen_hash.each_pair.lazy
+
+    loop do
+      chunk = []
+      entries_per_chunk.times do
+        begin
+          k, v = enumerator.next
+          chunk << {
+            key: k,
+            depth: v[:depth],
+            score: finite_score(v[:score]),
+            metadata: { saved_at: Time.now.utc.iso8601 }
+          }
+        rescue StopIteration
+          break
+        end
+      end
+      break if chunk.empty?
+
+      f.puts JSON.pretty_generate(chunk)
+      written_entries += chunk.size
+      progress_bar_entries(written_entries, total_entries, action: "Saving (JSON)")
+    end
+  end
+end
+
+def load_seen_json(filename)
+  seen = {}
+  return seen unless File.exist?(filename)
+
+  file_size = File.size(filename)
+  read_bytes = 0
+
+  File.open(filename, "r:utf-8") do |f|
+    buffer = ""
+    f.each_line do |line|
+      buffer << line
+      if line.strip.end_with?("]")  # end of a JSON array chunk
+        begin
+          chunk = JSON.parse(buffer, symbolize_names: true)
+          chunk.each { |entry| seen[entry[:key]] = { depth: entry[:depth], score: entry[:score] } }
+        rescue JSON::ParserError => e
+          puts "Skipping invalid JSON chunk: #{e}"
+        end
+        read_bytes += buffer.bytesize
+        progress_bar_bytes(read_bytes, file_size, action: "Loading (JSON)")
+        buffer = ""  # reset buffer for next chunk
+      end
+    end
+  end
+
+  # Ensure progress reaches 100%
+  progress_bar_bytes(file_size, file_size, action: "Loading (JSON)")
+  seen
+end
+
+
+def load_cache(filename)
+  load_seen_json(filename)
+rescue => e
+  puts "Failed to load cache (#{e.class}): #{e}. Starting with empty cache."
+  {}
+end
+
+def progress_bar_entries(current, total, width: 40, action: "Progress")
+  percent = (current.to_f / [total,1].max * 100).to_i
+  filled = (current.to_f / [total,1].max * width).to_i
+  bar = "=" * filled + " " * (width - filled)
+  print "\r#{action}: [#{bar}] #{percent}%"
+  $stdout.flush
+  puts if current >= total
+end
+
+def progress_bar_bytes(read_bytes, total_bytes, width: 40, action: "Progress")
+  total_bytes = 1 if total_bytes == 0
+  percent = (read_bytes.to_f / total_bytes * 100).to_i
+  filled = (read_bytes.to_f / total_bytes * width).to_i
+  bar = "=" * filled + " " * (width - filled)
+  print "\r#{action}: [#{bar}] #{percent}%"
+  $stdout.flush
+  puts if read_bytes >= total_bytes
+end
+
+def finite_score(score)
+  if score == Float::INFINITY
+    9999
+  elsif score == -Float::INFINITY
+    -9999
+  else
+    score
+  end
+end
+
+# -------------------
 # Numpad ↔ internal index mapping helpers
 # -------------------
 def numpad_to_index(n)
@@ -51,9 +153,7 @@ end
 # Helpers
 # -------------------
 
-# -------------------
 # Clear screen (cross-platform)
-# -------------------
 def clear_screen
   system("cls") || system("clear")
 end
@@ -123,7 +223,7 @@ def definite_score?(score, boards)
   score == 1 || score == -1 || score == 0 && overall_winner(boards)
 end
 
-def minimax(boards, available_boards, depth, maximizing, max_depth=MAX_DEPTH, alpha=-Float::INFINITY, beta=Float::INFINITY)
+def minimax(boards, available_boards, depth, maximizing, max_depth=MAX_DEPTH, alpha=-Float::INFINITY, beta= -Float::INFINITY)
   key = serialize(boards, available_boards, maximizing ? "X" : "O")
 
   # Use cached score only if it is from a deeper or equal depth **and** is definitive
@@ -226,14 +326,10 @@ def best_moves(boards, available_boards, maximizing)
 
       if !$dev
         moves_done += 1
-        blocks = ((moves_done.to_f / total_moves) * 10).round
-        percent = ((moves_done.to_f / total_moves) * 100).round
-        print "\r[#{'█' * blocks}#{'-' * (10 - blocks)}] #{percent}%"
+        progress_bar_entries(moves_done, total_moves, width: 40, action: "AI evaluating moves")
       end
     end
   end
-
-  print "\r[#{'█' * 10}] 100%\n" unless $dev
 
   best = scores.select { |_, s| s == best_score }.keys
   dict = {}
@@ -359,23 +455,8 @@ if player_enabled.include?(false) || num_players == 0
   end
 
   if File.exist?(CACHE_FILE)
-    file_size = File.size(CACHE_FILE)
-    loaded_data = ""
-    read_bytes = 0
-
-    File.open(CACHE_FILE, "r") do |f|
-      while chunk = f.read(1024)  # read in 1KB chunks
-        loaded_data << chunk
-        read_bytes += chunk.bytesize
-        percent = ((read_bytes.to_f / file_size) * 100).to_i
-        blocks = (percent / 10)
-        print "\r[" + "█" * blocks + "-" * (10 - blocks) + "] #{percent}%"
-      end
-    end
-
-    puts "\nParsing cache..."
-    $seen = YAML.safe_load(loaded_data, permitted_classes: [Symbol]) || {}
-    $seen = {} unless $seen.is_a?(Hash)
+    # Auto-detect and load (handles both old YAML and new chunked)
+    $seen = load_cache(CACHE_FILE)
   else
     $seen = {}
   end
@@ -494,5 +575,8 @@ end
 # Save cache
 # -------------------
 if player_enabled.include?(false) || num_players == 0
-  File.open(CACHE_FILE, "w") { |f| f.write($seen.to_yaml) }
+  # Save in chunked format (this will overwrite old YAML file next time)
+  puts "Saving cache..."
+  save_seen_json(CACHE_FILE, $seen, entries_per_chunk: CHUNK_DEFAULT_ENTRIES)
+  puts "\nCache saved (JSON)."
 end
